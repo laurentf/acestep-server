@@ -19,7 +19,10 @@ docker pull naturelbenton/acestep-server:latest
 - [Running the Container](#running-the-container)
 - [API Reference](#api-reference)
 - [Configuration](#configuration)
+- [Available Models](#available-models)
+- [LM Backend: vLLM vs PyTorch](#lm-backend-vllm-vs-pytorch)
 - [Performance & VRAM Tuning](#performance--vram-tuning)
+- [Testing with curl](#testing-with-curl)
 - [Why This Image](#why-this-image)
 - [Project Structure](#project-structure)
 - [License](#license)
@@ -264,6 +267,73 @@ All configuration is via environment variables. Most can be changed at runtime w
 | `ACESTEP_DEVICE` | `auto` | `auto`, `cuda`, `cpu`. Runtime. |
 | `ACESTEP_CHECKPOINTS_DIR` | `/app/checkpoints` | Where the baked weights live. Runtime. |
 
+## Available Models
+
+ACE-Step v1.5 ships several DiT and LM variants. The default image bakes the most useful ones (xl-turbo + the unified bundle which includes turbo, VAE, Qwen3 embedding, LM 1.7B). Other variants require a rebuild with the corresponding `ACESTEP_DIT_MODEL` / `ACESTEP_LM_MODEL` build arg.
+
+### DiT (diffusion transformer — the actual music generator)
+
+| Model | Params | VRAM int8 | VRAM bf16 | Speed | Use case |
+|---|---|---|---|---|---|
+| `acestep-v15-turbo` | 2B | ~3 GB | ~5 GB | 8 steps | Default for most cases. Distilled for fast inference. |
+| `acestep-v15-xl-turbo` | 4B | ~5 GB | ~9 GB | 8 steps | Higher fidelity, more nuanced timbres. Needs ≥12 GB VRAM with int8 + offload. |
+| `acestep-v15-base` | 2B | ~3 GB | ~5 GB | 25–50 steps | Non-distilled. Higher quality with CFG, but slower. |
+| `acestep-v15-sft` | 2B | ~3 GB | ~5 GB | 25–50 steps | SFT-tuned base. Better instruction following. |
+| `acestep-v15-xl-base` | 4B | ~5 GB | ~9 GB | 25–50 steps | XL non-distilled. Best fidelity if VRAM allows. |
+| `acestep-v15-xl-sft` | 4B | ~5 GB | ~9 GB | 25–50 steps | XL SFT-tuned. |
+
+> Only `turbo` and `xl-turbo` are baked in the default image. Other variants require a rebuild.
+
+### LM (5Hz semantic language model — for thinking mode)
+
+The LM generates two things during `thinking=true`: Phase 1 — Chain-of-Thought metadata (BPM, keyscale, timesignature, language, expanded caption), and Phase 2 — 150 audio semantic tokens that condition the DiT. Skip the LM entirely with `ACESTEP_INIT_LM=false` to save VRAM.
+
+| Model | Params | VRAM (PT backend) | VRAM (vLLM backend) | Quality |
+|---|---|---|---|---|
+| `acestep-5Hz-lm-0.6B` | 0.6B | ~1.5–2 GB | ~3–4 GB | OK metadata, basic structure. Fast. |
+| `acestep-5Hz-lm-1.7B` | 1.7B | ~3.5–4 GB | ~6–10 GB | **Recommended.** Same as writ-fm production. Solid lyric alignment. |
+| `acestep-5Hz-lm-4B` | 4B | ~8 GB | ~14 GB | Best — pristine metadata, long-form coherence. Heavy. |
+
+### When to disable thinking
+
+| Scenario | Recommendation |
+|---|---|
+| Short bumpers (<30s), instrumentals | `INIT_LM=false` — DiT alone is enough, save 4 GB VRAM |
+| Songs without lyrics, 1–3 min | LM helps with structure (intro/verse/chorus) but optional |
+| Songs with lyrics | **LM required** — handles vocal/instrument alignment, language detection, BPM matching |
+| Latency-critical use | `INIT_LM=false` or LM 0.6B — saves 10–25s per generation |
+
+## LM Backend: vLLM vs PyTorch
+
+The 5Hz LM can run on two backends, controlled by `ACESTEP_LM_BACKEND`.
+
+### vLLM (`ACESTEP_LM_BACKEND=vllm`)
+
+- ✅ **2–5× faster** Phase 1+2 generation (Qwen3 architecture, optimized kernels, KV cache)
+- ✅ Production-grade — same backend writ-fm uses
+- ❌ **Pre-allocates VRAM aggressively** at init (KV cache + buffers + weights). Typically grabs 6–10 GB even for the 1.7B model.
+- ❌ Buggy auto-tuning in ace-step: `gpu_memory_utilization` is computed as `(DiT_VRAM_used + LM_target) / total_GPU` but vLLM interprets this fraction as its *own* allocation budget — leading to over-allocation. Symptom: VRAM pre-flight check fails with `Insufficient free VRAM` mid-generation.
+- ❌ Requires `build-essential` (gcc/g++) in the image for triton runtime kernel compilation. Already included in this image — but if you fork a slimmer base, it'll silently fall back to PyTorch.
+- ❌ First inference slower (~30s warmup compiling triton kernels — cached after, lost on container restart)
+
+### PyTorch (`ACESTEP_LM_BACKEND=pt`)
+
+- ✅ **Predictable VRAM usage** — no pre-allocation, dynamic per-request
+- ✅ Reliable — no warmup quirks, no runtime compilation
+- ✅ Works on any CUDA setup — no triton kernel issues
+- ❌ ~30% slower than vLLM on Phase 1+2
+
+### Decision matrix
+
+| Situation | Recommended backend |
+|---|---|
+| Standalone server, GPU dedicated to ACE-Step, ≥16 GB VRAM | **vLLM** — best speed |
+| GPU shared with other models (e.g. TTS, ASR) | **PT** — predictable VRAM, no surprises |
+| ≤12 GB VRAM | **PT** — vLLM over-allocation will OOM |
+| First-time setup / debugging | **PT** — eliminates one variable |
+
+The default in this image is `vllm`. Switch to `pt` whenever you hit VRAM issues.
+
 ## Performance & VRAM Tuning
 
 The default image bakes both `xl-turbo` (4B) and the unified ACE-Step bundle (which includes turbo + VAE + Qwen3 embedding + LM 1.7B). You can pick the active DiT and LM at runtime via env vars.
@@ -284,6 +354,131 @@ RTF = Real-Time Factor (wall-clock time / audio duration). Lower is better; 1.0�
 - **`ACESTEP_LM_BACKEND=vllm` over-allocates VRAM** in some configurations because ace-step's `gpu_memory_utilization` calculation sums DiT + LM target as a fraction of total GPU memory, but vLLM interprets it as its own allocation budget. Symptom: VRAM pre-flight check fails with `Insufficient free VRAM`. Workaround: switch to `ACESTEP_LM_BACKEND=pt`.
 - **`ACESTEP_OFFLOAD_TO_CPU=true` is very slow with INT8 quantization** because torch 2.10 + torchao 0.16 cannot perform `model.to('cuda')` in bulk on `AffineQuantizedTensor` — it falls back to per-parameter transfer (~90 seconds per model load). Use `false` whenever VRAM allows.
 - **First request after startup is slower** by 15–30s due to torch.compile / triton / vLLM warmup. The cache is in `/root/.cache/torch/inductor` inside the container and is lost on `docker compose down`. Mount a volume to persist.
+
+## Testing with curl
+
+All examples assume the server is reachable at `http://localhost:8000`. Replace with your container/host as needed.
+
+### 1. Health check (always first — confirms models loaded)
+
+```bash
+curl -s http://localhost:8000/health | jq
+```
+
+```json
+{
+  "status": "ok",
+  "dit_model": "acestep-v15-turbo",
+  "dit_loaded": true,
+  "lm_model": "acestep-5Hz-lm-1.7B",
+  "quantization": "int8_weight_only",
+  "offload_to_cpu": false,
+  "device": "auto"
+}
+```
+
+If `dit_loaded` is `false`, the server is still warming up — wait 30–60s after container start. If `lm_model` is `null`, the LM didn't load (check logs or `INIT_LM`).
+
+### 2. Minimal smoke test — short instrumental
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "caption": "uplifting indie pop with female vocals",
+    "lyrics": "[Instrumental]",
+    "instrumental": true,
+    "duration": 30,
+    "audio_format": "wav",
+    "seed": 42,
+    "thinking": true
+  }' \
+  -o response.json
+
+# Decode the base64 audio out of the JSON
+jq -r '.audios[0]' response.json | base64 -d > output.wav
+
+# Inspect metadata
+jq '.metadata' response.json
+```
+
+Set `--max-time 600` if you generate >60s of audio (sync request, no streaming).
+
+### 3. One-liner (audio straight to a file)
+
+```bash
+curl -sS -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"caption":"tense ambient cinematic score","duration":30}' \
+  | jq -r '.audios[0]' | base64 -d > output.wav && ffplay -nodisp -autoexit output.wav
+```
+
+Works on Linux/macOS with `ffplay` (ffmpeg). Replace with `afplay` on macOS or any WAV player on Windows.
+
+### 4. Full song with lyrics (thinking mode helps with vocal alignment)
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  --max-time 600 \
+  -d '{
+    "caption": "energetic pop rock, female vocals, 90s alternative vibe",
+    "lyrics": "[verse]\nWalking down the street tonight\n[chorus]\nFeels alright, feels alright, feels alright\n[verse]\nNothing else matters now\n[chorus]\nFeels alright, feels alright, feels alright",
+    "instrumental": false,
+    "duration": 120,
+    "audio_format": "flac",
+    "seed": 7,
+    "thinking": true
+  }' \
+  | jq -r '.audios[0]' | base64 -d > song.flac
+```
+
+### 5. Reproducibility check — same seed = same audio
+
+```bash
+for i in 1 2; do
+  curl -sS -X POST http://localhost:8000/generate \
+    -H "Content-Type: application/json" \
+    -d '{"caption":"calm piano","duration":15,"seed":42}' \
+    | jq -r '.audios[0]' | base64 -d > "run_$i.wav"
+done
+
+md5sum run_1.wav run_2.wav   # should match
+```
+
+### 6. Bypass thinking on a single request (LM still loaded but unused)
+
+```bash
+curl -sS -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "caption": "tense ambient music for a heated chat moment",
+    "duration": 20,
+    "thinking": false
+  }' \
+  | jq -r '.audios[0]' | base64 -d > raw.wav
+```
+
+Useful when the LM keeps rewriting your caption into something else and you want the DiT to interpret your prompt verbatim.
+
+### 7. Error handling
+
+If generation fails the server returns HTTP 500 with a JSON body:
+
+```bash
+curl -sS -w "\nHTTP %{http_code}\n" -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"caption":"...","duration":300}'
+```
+
+Common errors:
+
+| Status | Cause |
+|---|---|
+| `400` | Validation failed — duration out of range, bad audio_format, etc. |
+| `500 "DiT model not loaded"` | Server not finished warming up. Retry in 30s. |
+| `500 "Insufficient free VRAM"` | OOM — switch `LM_BACKEND` to `pt`, set `INIT_LM=false`, or pick a smaller DiT/LM. |
+| `500 "Generation failed"` | Inference error — check container logs. |
 
 ## Why This Image
 
