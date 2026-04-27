@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.python-version
+build.log
+acestep-test-results/
+.env
+.env.local
+*.wav
+*.flac
+*.mp3
